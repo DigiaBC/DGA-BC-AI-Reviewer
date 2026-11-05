@@ -1,0 +1,15 @@
+{
+  "name": "dga-bc-ai-reviewer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned runtime dependencies for the Business Central AI Reviewer action.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@continuedev/cli": "1.5.47",
+    "@modelcontextprotocol/server-filesystem": "2.2.0",
+    "parse-diff": "0.12.0"
+  }
+}

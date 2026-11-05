@@ -53,7 +53,8 @@ jobs:
       (github.event_name == 'pull_request') ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request != null &&
-       contains(github.event.comment.body, '/review'))
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+       startsWith(github.event.comment.body, '/review'))
     runs-on: ubuntu-latest
 
     # Optional but recommended to avoid overlapping runs on the same PR
@@ -68,7 +69,8 @@ jobs:
           fetch-depth: 0
 
       - name: Run AI Code Review
-        uses: ACSG-BizApps/bc-ai-reviewer@main
+        # Replace with the immutable commit SHA approved by your organization.
+        uses: your-company/bc-ai-reviewer@0123456789abcdef0123456789abcdef01234567
         with:
           GITHUB_TOKEN: ${{ github.token }}
           MODELS_BLOCK: |
@@ -84,6 +86,8 @@ jobs:
                     reasoning:
                       effort: high
 
+          ALLOWED_PROVIDER_HOSTS: "your-azure-resource.openai.azure.com"
+
           # Review configuration
           MAX_COMMENTS: 20
           AUTO_DETECT_APPS: true
@@ -95,7 +99,12 @@ jobs:
           ISSUE_COUNT: 0
           FETCH_CLOSED_ISSUES: true
           BASE_PROMPT_EXTRA: ""
-          DEBUG_PAYLOAD: true
+          DEBUG_PAYLOAD: false
+          APPROVE_REVIEWS: false
+          MAX_FILE_BYTES: 200000
+          MAX_PAYLOAD_BYTES: 4000000
+          MAX_CONTEXT_FILES: 30
+          TRUSTED_ASSOCIATIONS: "OWNER,MEMBER,COLLABORATOR"
           PROJECT_CONTEXT: |
             Repository contains Business Central AppSource Apps, related documentation based on docfx, and a slightly extended version of AL-Go for GitHub.
 ```
@@ -110,7 +119,7 @@ These inputs are defined in action.yml (defaults in parentheses).
 |---|:---:|---:|---|
 | GITHUB_TOKEN | string | required | GitHub token with repo scope. Defaults to `github.token` when not passed explicitly. |
 | MODELS_BLOCK | string (YAML) | required | Multiline YAML that fully replaces the default `models:` section. |
-| APPROVE_REVIEWS | boolean | false | When true, the bot uses the model’s `suggestedAction` to choose APPROVE, REQUEST_CHANGES, or COMMENT for the summary review. |
+| APPROVE_REVIEWS | boolean | false | Must remain false. The hardened action rejects AI approval or request-change authority. |
 | MAX_COMMENTS | number | 10 | Maximum inline comments to post (0 = unlimited; GitHub caps at 1000 per PR). |
 | PROJECT_CONTEXT | string | "" | Optional architecture / guidelines text injected into the prompt. |
 | CONTEXT_FILES | string | "" | Comma-separated globs for extra context files (read from HEAD). |
@@ -124,11 +133,16 @@ These inputs are defined in action.yml (defaults in parentheses).
 | BASE_PROMPT_EXTRA | string | "" | Free-form text appended to the base review prompt. |
 | DEBUG_PAYLOAD | boolean | false | When true, prints the JSON payload to logs (use sparingly; can be large). |
 | SNIPPET_CONTEXT_LINES | number | 12 | Lines of context around each changed line in numbered snippets. |
+| MAX_FILE_BYTES | number | 200000 | Maximum UTF-8 bytes for an individual file or changed-file context. |
+| MAX_PAYLOAD_BYTES | number | 4000000 | Maximum UTF-8 bytes for the complete model prompt. |
+| MAX_CONTEXT_FILES | number | 30 | Maximum repository context files sent to the model. |
+| TRUSTED_ASSOCIATIONS | string | OWNER,MEMBER,COLLABORATOR | Author associations allowed to invoke `/review`. |
+| ALLOWED_PROVIDER_HOSTS | string | required | Exact hostname allowlist for explicit HTTPS model endpoints. The action fails closed when the endpoint is missing or unapproved. |
 
 
 ## Runtime behavior (what the action does)
 
-- Installs Node.js v20, `parse-diff`, and the [Continue CLI](https://docs.continue.dev/guides/cli); optionally installs `uv` for MCP integration.
+- Installs Node.js v24 and lockfile-pinned runtime dependencies with `npm ci`.
 - Merges continue [MODELS_BLOCK](https://docs.continue.dev/reference#models) into the bundled default-config.yaml at runtime via `.github/actions/continue/merge-config.ps1`, writes the merged file to `$RUNNER_TEMP`, and sets `CONTINUE_CONFIG`.
 - Executes `scripts/continue-review.ps1` which:
   - Fetches the PR unified diff and parses it with `scripts/parse-diff.js`.
@@ -141,8 +155,11 @@ These inputs are defined in action.yml (defaults in parentheses).
 ## Troubleshooting & tips
 
 - If the reviewer prints errors about `CONTINUE_CONFIG` being invalid, ensure the action sets it to the merged config path (the composite action does this automatically).
-- If the model returns non-JSON or malformed JSON, the scripts attempt sanitisation and retries; inspect the uploaded CLI logs (artifact `.continue-logs/`) for raw provider output.
+- If the model returns non-JSON or malformed JSON, the script fails without printing raw model output. Keep `DEBUG_PAYLOAD` disabled for customer repositories.
 - Never commit real API keys or secrets. Use GitHub Secrets. The merged config is written to `$RUNNER_TEMP` and is not committed.
+- Pin this action and all third-party actions to approved full commit SHAs.
+- Use a regional Azure deployment and private networking or an egress proxy where required by company policy. The action validates configured endpoint hosts but cannot enforce runner-level networking.
+- Pilot with synthetic or non-customer AL code and retain mandatory human review before enabling customer repositories.
 
 ## Where things live in this repo
 

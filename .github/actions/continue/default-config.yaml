@@ -18,7 +18,6 @@ context:
     params:
       onlyPinned: true
   - provider: problems
-  - provider: terminal
 
 rules:
   - uses: file://.continue/rules/pr-reviewer.md
@@ -28,19 +27,14 @@ prompts:
 
 docs: []
 mcpServers:
-  # - name: "github"
-  #   type: "streamable-http"
-  #   url: "https://api.githubcopilot.com/mcp/"
-  #   requestOptions:
-  #     headers:
-  #       Authorization: "Bearer {{GITHUB_TOKEN}}"
-  #       X-MCP-Toolsets: "pull_requests,repos,issues"
-  #       X-MCP-Readonly: "true"
-  #       X-MCP-Lockdown: "true"
   - name: "filesystem"
     command: "npx"
     args:
-      - "-y"
-      - "@modelcontextprotocol/server-filesystem"
+      - "--prefix"
+      - "{{GITHUB_ACTION_PATH}}"
+      - "--no-install"
+      - "mcp-server-filesystem"
+      - "--read-only"
+      - "--confine-roots"
       - "{{GITHUB_WORKSPACE}}"
 data: []

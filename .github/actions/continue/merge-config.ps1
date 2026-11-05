@@ -101,6 +101,33 @@ function SubstitutePlaceholders([string]$text) {
 # Perform substitution on the models block itself
 $mb = SubstitutePlaceholders $mb
 
+# Optionally restrict model traffic to explicitly approved provider hosts.
+$allowedProviderHosts = @(
+  $env:ALLOWED_PROVIDER_HOSTS -split ',' |
+    ForEach-Object { $_.Trim().ToLowerInvariant() } |
+    Where-Object { $_ }
+)
+if ($allowedProviderHosts.Count -gt 0) {
+  $providerUris = @(
+    [regex]::Matches($mb, 'https://[^\s"''#]+') |
+      ForEach-Object {
+        try { [uri]$_.Value.TrimEnd('/', ',') } catch { $null }
+      } |
+      Where-Object { $_ }
+  )
+
+  if ($providerUris.Count -eq 0) {
+    throw 'ALLOWED_PROVIDER_HOSTS is set, but MODELS_BLOCK contains no explicit HTTPS provider endpoint to validate.'
+  }
+
+  foreach ($providerUri in $providerUris) {
+    $providerHost = $providerUri.DnsSafeHost.ToLowerInvariant()
+    if ($allowedProviderHosts -notcontains $providerHost) {
+      throw "Provider host '$providerHost' is not present in ALLOWED_PROVIDER_HOSTS."
+    }
+  }
+}
+
 # Helper: write a redacted copy of the merged config for debugging (hides secrets)
 
 

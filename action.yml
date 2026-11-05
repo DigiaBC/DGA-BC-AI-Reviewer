@@ -19,7 +19,7 @@ inputs:
 
   # Review behaviour
   APPROVE_REVIEWS:
-    description: "Let the bot approve / request-changes (based on AI output 'suggestedAction')"
+    description: "Deprecated security control. Must remain false; AI reviews cannot approve or request changes."
     type: boolean
     default: false
   MAX_COMMENTS:
@@ -87,49 +87,89 @@ inputs:
     description: "Number of context lines to include around each changed line when building rich snippets"
     type: number
     default: 12
+  MAX_FILE_BYTES:
+    description: "Maximum UTF-8 bytes allowed for any individual file or changed-file review context."
+    type: number
+    default: 200000
+  MAX_PAYLOAD_BYTES:
+    description: "Maximum UTF-8 bytes allowed for the complete model prompt."
+    type: number
+    default: 4000000
+  MAX_CONTEXT_FILES:
+    description: "Maximum number of repository context files sent to the model."
+    type: number
+    default: 30
+  TRUSTED_ASSOCIATIONS:
+    description: "Comma-separated GitHub author associations allowed to trigger /review."
+    type: string
+    default: "OWNER,MEMBER,COLLABORATOR"
+  ALLOWED_PROVIDER_HOSTS:
+    description: "Required comma-separated allowlist of exact LLM endpoint hostnames. MODELS_BLOCK must contain an explicit HTTPS endpoint."
+    type: string
+    required: true
 
 runs:
   using: composite
   steps:
-    - name: Setup Node.js (v20)
-      uses: actions/setup-node@v4
+    - name: Setup Node.js (v24)
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
       with:
-        node-version: 20
+        node-version: 24
+        cache: npm
 
-    - name: Install helpers parse-diff
+    - name: Install pinned runtime dependencies
       shell: pwsh
       working-directory: ${{ github.action_path }}
-      run: |      
-        npm install --no-save parse-diff@latest
-
-    - name: Install Continue CLI
-      shell: pwsh
-      run: |      
-        npm i -g @continuedev/cli
+      run: |
+        npm ci --omit=dev
+        (Join-Path "${{ github.action_path }}" 'node_modules/.bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
     - name: Run AI Code Review (Continue + MCP)
       shell: pwsh
       env:
         GITHUB_TOKEN:                 ${{ inputs.GITHUB_TOKEN || github.token }}
         MODELS_BLOCK:                 ${{ inputs.MODELS_BLOCK }}
+        INPUT_MAX_COMMENTS:           ${{ inputs.MAX_COMMENTS }}
+        INPUT_PROJECT_CONTEXT:        ${{ inputs.PROJECT_CONTEXT }}
+        INPUT_CONTEXT_FILES:          ${{ inputs.CONTEXT_FILES }}
+        INPUT_INCLUDE_PATTERNS:       ${{ inputs.INCLUDE_PATTERNS }}
+        INPUT_EXCLUDE_PATTERNS:       ${{ inputs.EXCLUDE_PATTERNS }}
+        INPUT_ISSUE_COUNT:            ${{ inputs.ISSUE_COUNT }}
+        INPUT_FETCH_CLOSED_ISSUES:    ${{ inputs.FETCH_CLOSED_ISSUES }}
+        INPUT_AUTO_DETECT_APPS:       ${{ inputs.AUTO_DETECT_APPS }}
+        INPUT_INCLUDE_PERMISSIONS:    ${{ inputs.INCLUDE_APP_PERMISSIONS }}
+        INPUT_INCLUDE_MARKDOWN:       ${{ inputs.INCLUDE_APP_MARKDOWN }}
+        INPUT_BASE_PROMPT_EXTRA:      ${{ inputs.BASE_PROMPT_EXTRA }}
+        INPUT_SNIPPET_CONTEXT_LINES:  ${{ inputs.SNIPPET_CONTEXT_LINES }}
+        INPUT_MAX_FILE_BYTES:         ${{ inputs.MAX_FILE_BYTES }}
+        INPUT_MAX_PAYLOAD_BYTES:      ${{ inputs.MAX_PAYLOAD_BYTES }}
+        INPUT_MAX_CONTEXT_FILES:      ${{ inputs.MAX_CONTEXT_FILES }}
+        INPUT_TRUSTED_ASSOCIATIONS:   ${{ inputs.TRUSTED_ASSOCIATIONS }}
+        INPUT_APPROVE_REVIEWS:        ${{ inputs.APPROVE_REVIEWS }}
+        INPUT_DEBUG_PAYLOAD:          ${{ inputs.DEBUG_PAYLOAD }}
+        ALLOWED_PROVIDER_HOSTS:       ${{ inputs.ALLOWED_PROVIDER_HOSTS }}
       run: |
         $params = @{
-          GitHubToken           = "${{ inputs.GITHUB_TOKEN || github.token }}"
-          MaxComments           = [int]"${{ inputs.MAX_COMMENTS }}"
-          ProjectContext        = "${{ inputs.PROJECT_CONTEXT }}"
-          ContextFiles          = "${{ inputs.CONTEXT_FILES }}"
-          IncludePatterns       = "${{ inputs.INCLUDE_PATTERNS }}"
-          ExcludePatterns       = "${{ inputs.EXCLUDE_PATTERNS }}"
-          IssueCount            = [int]"${{ inputs.ISSUE_COUNT }}"
-          FetchClosedIssues     = [bool]::Parse("${{ inputs.FETCH_CLOSED_ISSUES }}")
-          AutoDetectApps        = [bool]::Parse("${{ inputs.AUTO_DETECT_APPS }}")
-          IncludeAppPermissions = [bool]::Parse("${{ inputs.INCLUDE_APP_PERMISSIONS }}")
-          IncludeAppMarkdown    = [bool]::Parse("${{ inputs.INCLUDE_APP_MARKDOWN }}")
-          BasePromptExtra       = "${{ inputs.BASE_PROMPT_EXTRA }}"
-          SnippetContextLines   = [int]"${{ inputs.SNIPPET_CONTEXT_LINES }}"
+          GitHubToken           = $env:GITHUB_TOKEN
+          MaxComments           = [int]$env:INPUT_MAX_COMMENTS
+          ProjectContext        = $env:INPUT_PROJECT_CONTEXT
+          ContextFiles          = $env:INPUT_CONTEXT_FILES
+          IncludePatterns       = $env:INPUT_INCLUDE_PATTERNS
+          ExcludePatterns       = $env:INPUT_EXCLUDE_PATTERNS
+          IssueCount            = [int]$env:INPUT_ISSUE_COUNT
+          FetchClosedIssues     = [bool]::Parse($env:INPUT_FETCH_CLOSED_ISSUES)
+          AutoDetectApps        = [bool]::Parse($env:INPUT_AUTO_DETECT_APPS)
+          IncludeAppPermissions = [bool]::Parse($env:INPUT_INCLUDE_PERMISSIONS)
+          IncludeAppMarkdown    = [bool]::Parse($env:INPUT_INCLUDE_MARKDOWN)
+          BasePromptExtra       = $env:INPUT_BASE_PROMPT_EXTRA
+          SnippetContextLines   = [int]$env:INPUT_SNIPPET_CONTEXT_LINES
+          MaxFileBytes          = [long]$env:INPUT_MAX_FILE_BYTES
+          MaxPayloadBytes       = [long]$env:INPUT_MAX_PAYLOAD_BYTES
+          MaxContextFiles       = [int]$env:INPUT_MAX_CONTEXT_FILES
+          TrustedAssociations   = $env:INPUT_TRUSTED_ASSOCIATIONS
         }
-        if ("${{ inputs.APPROVE_REVIEWS }}" -eq "true") { $params.ApproveReviews = $true }
-        if ("${{ inputs.DEBUG_PAYLOAD }}" -eq "true")   { $params.DebugPayload   = $true }
+        if ($env:INPUT_APPROVE_REVIEWS -eq "true") { throw "APPROVE_REVIEWS is disabled in this hardened action; a human reviewer must approve changes." }
+        if ($env:INPUT_DEBUG_PAYLOAD -eq "true")   { $params.DebugPayload = $true }
 
 
                 # Always create merged config from MODELS_BLOCK and write to runner temp
@@ -137,25 +177,21 @@ runs:
         Write-Host "Creating merged config at $mergeOut from MODELS_BLOCK"
         
         # The merge helper reads MODELS_BLOCK from the environment
-        $env:MODELS_BLOCK = "${{ inputs.MODELS_BLOCK }}"
         & "${{ github.action_path }}/.github/actions/continue/merge-config.ps1" -out $mergeOut
         $cfgPath = $mergeOut
 
         # Export CONTINUE_CONFIG for the PowerShell script to pick up
         $env:CONTINUE_CONFIG = $cfgPath
 
-        & "${{ github.action_path }}/scripts/continue-review.ps1" @params
-
-        # Cleanup: remove the merged config file written to the runner temp
         try {
-          if (Test-Path $cfgPath) {
-            Remove-Item -LiteralPath $cfgPath -Force -ErrorAction SilentlyContinue
-            Write-Host "Removed merged config file at $cfgPath"
+          & "${{ github.action_path }}/scripts/continue-review.ps1" @params
+          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+            throw "AI review script failed with exit code $LASTEXITCODE."
           }
-          # Unset CONTINUE_CONFIG from the environment (process scope) and Env: drive
+        } finally {
+          Remove-Item -LiteralPath $cfgPath -Force -ErrorAction SilentlyContinue
           Remove-Item Env:CONTINUE_CONFIG -ErrorAction SilentlyContinue
+          Remove-Item Env:ALLOWED_PROVIDER_HOSTS -ErrorAction SilentlyContinue
           [Environment]::SetEnvironmentVariable('CONTINUE_CONFIG', $null, 'Process')
-        } catch {
-          Write-Warning "Failed to delete merged config file: $_"
         }
 

@@ -19,8 +19,29 @@ param(
   [switch]$ApproveReviews,
   [switch]$DebugPayload,
   [switch]$DryRun,
-  [int]$SnippetContextLines = 12
+  [int]$SnippetContextLines = 12,
+  [long]$MaxFileBytes = 200000,
+  [long]$MaxPayloadBytes = 4000000,
+  [int]$MaxContextFiles = 30,
+  [string]$TrustedAssociations = "OWNER,MEMBER,COLLABORATOR"
 )
+
+$tempPrompt = $null
+$tempJson = $null
+$tempCnOut = $null
+
+function Get-Utf8ByteCount {
+  param([AllowEmptyString()][string]$Text)
+  return [Text.Encoding]::UTF8.GetByteCount($Text)
+}
+
+function Test-SensitivePath {
+  param([Parameter(Mandatory)][string]$Path)
+  $normalized = ($Path -replace '\\', '/').TrimStart('./').ToLowerInvariant()
+  return $normalized -match '(^|/)(\.git|\.ssh|\.alpackages|\.artifacts|node_modules|bin|obj|translations?|test[-_]?data|fixtures?|customer[-_]?exports?|exports?)(/|$)' -or
+    $normalized -match '(^|/)(\.env($|\.)|secrets?($|[._-])|credentials?($|[._-]))' -or
+    $normalized -match '\.(pfx|p12|pem|key|jks|keystore|csv|xlsx?|zip|7z|bak|bacpac)$'
+}
 
 
 ############################################################################
@@ -95,13 +116,28 @@ function Get-FileContent {
       return $null
     }
 
-    $localPath = Join-Path $repoRoot $Path
+    if (Test-SensitivePath -Path $Path) {
+      Write-Warning ("Blocked sensitive or generated path: {0}" -f $Path)
+      return $null
+    }
+
+    $rootFullPath = [IO.Path]::GetFullPath($repoRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $localPath = [IO.Path]::GetFullPath((Join-Path $repoRoot $Path))
+    if (-not $localPath.StartsWith($rootFullPath, [StringComparison]::OrdinalIgnoreCase)) {
+      Write-Warning ("Blocked path outside GITHUB_WORKSPACE: {0}" -f $Path)
+      return $null
+    }
     if (-not (Test-Path $localPath)) {
       Write-Warning ("Local file not found: {0}" -f $localPath)
       return $null
     }
 
     try {
+      $fileLength = (Get-Item -LiteralPath $localPath -ErrorAction Stop).Length
+      if ($fileLength -gt $MaxFileBytes) {
+        Write-Warning ("Skipping file larger than MaxFileBytes ({0} > {1}): {2}" -f $fileLength, $MaxFileBytes, $Path)
+        return $null
+      }
       Write-Host ("Reading file from workspace: {0}" -f $localPath)
       return Get-Content -Path $localPath -Raw -ErrorAction Stop
     } catch {
@@ -125,6 +161,20 @@ try {
 $owner, $repo = $env:GITHUB_REPOSITORY.Split('/')
 $evtPath = $env:GITHUB_EVENT_PATH
 $evt = Get-Content $evtPath -Raw | ConvertFrom-Json
+
+if ($env:GITHUB_EVENT_NAME -eq 'issue_comment') {
+  $trusted = @($TrustedAssociations -split ',' | ForEach-Object { $_.Trim().ToUpperInvariant() } | Where-Object { $_ })
+  $association = ([string]$evt.comment.author_association).ToUpperInvariant()
+  $commentBody = [string]$evt.comment.body
+  if ($trusted -notcontains $association) {
+    Write-Warning "Ignoring /review from untrusted author association '$association'."
+    return
+  }
+  if ($commentBody -notmatch '(?im)^\s*/review(?:\s|$)') {
+    Write-Warning "Issue comment does not contain a standalone /review command."
+    return
+  }
+}
 
 # When triggered by an issue_comment on a PR, GitHub places the PR link under
 # github.event.issue.pull_request, not at github.event.pull_request. Some
@@ -204,6 +254,10 @@ foreach ($f in $files) {
 $relevant = @()
 foreach ($f in $files) {
   $p = ($f.path -replace '\\','/').TrimStart('./')
+  if (Test-SensitivePath -Path $p) {
+    Write-Host "Skipping protected path $p"
+    continue
+  }
   $matchedInclude = $false
   foreach ($pat in $compiledIncludes) { if ($pat.IsMatch($p)) { $matchedInclude = $true; break } }
   $matchedExclude = $false
@@ -278,9 +332,14 @@ foreach ($f in $relevant) {
         }
     }
 
+    $reviewContext = $richLines -join "`n"
+    if ((Get-Utf8ByteCount -Text $reviewContext) -gt $MaxFileBytes) {
+      throw "Review context for '$path' exceeds MaxFileBytes. Reduce the PR size or SNIPPET_CONTEXT_LINES."
+    }
+
     $numberedFiles += [pscustomobject]@{
         path = $path
-        diff = ($richLines -join "`n")
+        diff = $reviewContext
     }
 }
 
@@ -304,19 +363,25 @@ if ($AutoDetectApps) {
     }
   }
   foreach ($appJson in $relevantApps.Keys) {
+    if ($ctxFiles.Count -ge $MaxContextFiles) { break }
     $appRoot = Split-Path $appJson -Parent
     $rel = [IO.Path]::GetRelativePath($repoRoot,$appJson) -replace '\\','/'
-    $ctxFiles += [pscustomobject]@{ path=$rel; content=(Get-Content $appJson -Raw) }
+    $appContent = Get-FileContent -Owner $owner -Repo $repo -Path $rel -RefSha $headSha
+    if ($appContent) { $ctxFiles += [pscustomobject]@{ path=$rel; content=$appContent } }
     if ($IncludeAppPermissions) {
       Get-ChildItem -Path $appRoot -Recurse -Include '*.PermissionSet.al','*.Entitlement.al' | % {
+        if ($ctxFiles.Count -ge $MaxContextFiles) { return }
         $relp = [IO.Path]::GetRelativePath($repoRoot,$_.FullName) -replace '\\','/'
-        $ctxFiles += [pscustomobject]@{ path=$relp; content=(Get-Content $_.FullName -Raw) }
+        $permissionContent = Get-FileContent -Owner $owner -Repo $repo -Path $relp -RefSha $headSha
+        if ($permissionContent) { $ctxFiles += [pscustomobject]@{ path=$relp; content=$permissionContent } }
       }
     }
     if ($IncludeAppMarkdown) {
       Get-ChildItem -Path $appRoot -Recurse -Filter '*.md' | % {
+        if ($ctxFiles.Count -ge $MaxContextFiles) { return }
         $relm = [IO.Path]::GetRelativePath($repoRoot,$_.FullName) -replace '\\','/'
-        $ctxFiles += [pscustomobject]@{ path=$relm; content=(Get-Content $_.FullName -Raw) }
+        $markdownContent = Get-FileContent -Owner $owner -Repo $repo -Path $relm -RefSha $headSha
+        if ($markdownContent) { $ctxFiles += [pscustomobject]@{ path=$relm; content=$markdownContent } }
       }
     }
   }
@@ -470,12 +535,19 @@ if ($DebugPayload -and $bcObjects.Count -gt 0) {
 # Custom context globs (from repo HEAD)
 $ctxGlobs = $ContextFiles -split ',' | % { $_.Trim() } | ? { $_ }
 foreach ($glob in $ctxGlobs) {
+  if ($ctxFiles.Count -ge $MaxContextFiles) { break }
+  if (Test-SensitivePath -Path $glob) {
+    Write-Warning "Blocked sensitive context path '$glob'."
+    continue
+  }
   try {
     $blob = Invoke-GitHub -Path "/repos/$owner/$repo/contents/$($glob)?ref=$headSha"
     if ($blob.content) {
-      $ctxFiles += [pscustomobject]@{
-        path    = $glob
-        content = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($blob.content))
+      $contextContent = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($blob.content))
+      if ((Get-Utf8ByteCount -Text $contextContent) -le $MaxFileBytes) {
+        $ctxFiles += [pscustomobject]@{ path=$glob; content=$contextContent }
+      } else {
+        Write-Warning "Skipping context '$glob' because it exceeds MaxFileBytes."
       }
     }
   } catch { Write-Warning "Could not fetch context '$glob': $_" }
@@ -622,7 +694,11 @@ $payload = @{
 
 $tempPrompt = Join-Path $env:RUNNER_TEMP 'continue_prompt.txt'
 $tempJson   = Join-Path $env:RUNNER_TEMP 'continue_input.json'
-$payload | ConvertTo-Json -Depth 8 | Set-Content -Path $tempJson -Encoding UTF8
+$payloadJson = $payload | ConvertTo-Json -Depth 8
+if ((Get-Utf8ByteCount -Text $payloadJson) -gt $MaxPayloadBytes) {
+  throw "Review payload exceeds MaxPayloadBytes. Reduce the PR or context configuration."
+}
+$payloadJson | Set-Content -Path $tempJson -Encoding UTF8
 
 if ($DebugPayload) {
   Write-Host "::group::DEBUG: continue_input.json (payload)"
@@ -637,7 +713,7 @@ if ($DebugPayload) {
 }
 
 # Build a single prompt text (reviewContract + machine-readable section)
-@"
+$promptBody = @"
 $reviewContract
 
 ## DIFF (numbered)
@@ -654,7 +730,17 @@ $(( $bcObjects | ConvertTo-Json -Depth 5 ))
 
 ## PREVIOUS COMMENTS (truncated as needed)
 $(( $previousComments | ConvertTo-Json -Depth 4 ))
-"@ | Set-Content -Path $tempPrompt -Encoding UTF8
+
+## PULL REQUEST
+$(( $payload.pullRequest | ConvertTo-Json -Depth 4 ))
+
+## PROJECT CONTEXT
+$ProjectContext
+"@
+if ((Get-Utf8ByteCount -Text $promptBody) -gt $MaxPayloadBytes) {
+  throw "Complete model prompt exceeds MaxPayloadBytes. Reduce the PR or context configuration."
+}
+$promptBody | Set-Content -Path $tempPrompt -Encoding UTF8
 
 ############################################################################
 # Continue runner (single impl) — slug-only, no URL rewriting, stable Hub base
@@ -765,25 +851,16 @@ function Invoke-ContinueCli {
   Write-Host "Running Continue CLI..."
 
   # Invoke Continue CLI and stream output to runner while saving to a temp file for parsing
-  $tempCnOut = Join-Path $env:RUNNER_TEMP 'continue_cn_out.log'
+    $script:tempCnOut = Join-Path $env:RUNNER_TEMP 'continue_cn_out.log'
 
-  & cn --prompt $reviewPromptPath --verbose --config $Config `
-       -p (Get-Content -Raw $tempPromptFile) --auto 2>&1 |
-    Tee-Object -FilePath $tempCnOut
+    & cn --prompt $reviewPromptPath --config $Config `
+      -p (Get-Content -Raw $tempPromptFile) --auto *> $script:tempCnOut
 
   $exit = $LASTEXITCODE
-  $stdout = if (Test-Path $tempCnOut) { Get-Content -Raw $tempCnOut } else { "" }
+    $stdout = if (Test-Path $script:tempCnOut) { Get-Content -Raw $script:tempCnOut } else { "" }
 
   if ($exit -ne 0) {
-    Write-Host "::group::Continue CLI error output"
-    if ($stdout) {
-      $stdout -split "`n" | ForEach-Object { Write-Host $_ }
-    } else {
-      Write-Host "(no output from cn)"
-    }
-    Write-Host "::endgroup::"
-
-    throw ("Continue CLI failed (exit {0})." -f $exit)
+    throw ("Continue CLI failed (exit {0}); raw output was withheld from logs." -f $exit)
   }
 
   # Parse the CLI JSON output produced by the model run
@@ -921,11 +998,11 @@ if ($review.PSObject.Properties.Name -contains 'sources' -and $review.sources) {
 
   if ($sources.Count -gt 0) {
     $sourceLines = $sources | ForEach-Object {
-      $line = "- $($_.description)"
+      $line = '- {0}' -f [string]$_.description
       if ($_.PSObject.Properties.Name -contains 'url' -and `
           $null -ne $_.url -and `
           -not [string]::IsNullOrWhiteSpace([string]$_.url)) {
-        $line += " – $($_.url)"
+        $line = '{0} - {1}' -f $line, [string]$_.url
       }
       $line
     }
@@ -1024,7 +1101,7 @@ foreach ($c in $comments) {
       }
       $posted++
     } catch {
-      Write-Warning "Failed to post comment for $($path):$line - $($_.Exception.Message)"
+      Write-Warning ('Failed to post comment for {0}:{1} - {2}' -f $path, $line, $_.Exception.Message)
     }
   }
 }
@@ -1033,6 +1110,9 @@ Write-Host "Posted $posted inline/file-level comments."
 Write-Host "Done."
 } catch {
   Write-Error ("Fatal error in continue-review.ps1: {0}" -f $_.Exception.Message)
-  Write-Error $_.Exception.ToString()
   exit 1
+} finally {
+  @($tempPrompt, $tempJson, $tempCnOut) |
+    Where-Object { $_ } |
+    ForEach-Object { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }
 }
